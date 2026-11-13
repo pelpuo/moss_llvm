@@ -38,6 +38,7 @@ namespace llvm {
 class Error;
 class IRMover;
 class LLVMContext;
+class MemoryBuffer;
 class MemoryBufferRef;
 class Module;
 class raw_pwrite_stream;
@@ -124,6 +125,8 @@ private:
   // FIXME: Remove LTO class friendship once we have bitcode symbol tables.
   friend LTO;
   InputFile() = default;
+
+  // Owns the COPT-rewritten regular-LTO object so every MemoryBufferRef\n  // and BitcodeModule created from it remains valid for the InputFile lifetime.\n  std::unique_ptr<MemoryBuffer> CoptOwnedBuffer;\n  // COPT_INTERNAL_PREIRSYMTAB_V41
 
   std::vector<BitcodeModule> Mods;
   SmallVector<char, 0> Strtab;

@@ -88,6 +88,7 @@
 #include "llvm/Transforms/Scalar/JumpThreading.h"
 #include "llvm/Transforms/Utils/Debugify.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -1119,7 +1120,24 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
     } else if (PrepareForThinLTO) {
       MPM.addPass(PB.buildThinLTOPreLinkDefaultPipeline(Level));
     } else if (PrepareForLTO) {
-      MPM.addPass(PB.buildLTOPreLinkDefaultPipeline(Level));
+      // COPT_INTERNAL_DEFER_RAW_PRELINK_V42: emit raw frontend IR so COPT can install
+      // Oz/Os/O2 policy before the single O2 FullLTOPreLink pipeline.
+      const char *CoptDeferRaw = std::getenv("COPT_INTERNAL_DEFER_PRELINK");
+      const bool CoptDeferPreLink =
+          CoptDeferRaw && *CoptDeferRaw && StringRef(CoptDeferRaw) != "0" &&
+          !StringRef(CoptDeferRaw).equals_insensitive("false") &&
+          !CodeGenOpts.SampleProfileFile.empty();
+      if (CoptDeferPreLink) {
+        TheModule->addModuleFlag(llvm::Module::Override,
+                                 "COPTDeferredPreLink", uint32_t(1));
+        TheModule->addModuleFlag(llvm::Module::Override,
+                                 "COPTRawPreLink", uint32_t(1));
+        // Intentionally add NO LTO pre-link pipeline here.
+        // The stock O2 FullLTOPreLink pipeline is replayed once
+        // after COPT has installed the requested function policy.
+      } else {
+        MPM.addPass(PB.buildLTOPreLinkDefaultPipeline(Level));
+      }
     } else {
       MPM.addPass(PB.buildPerModuleDefaultPipeline(Level));
     }

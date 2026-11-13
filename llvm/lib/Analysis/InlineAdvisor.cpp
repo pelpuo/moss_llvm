@@ -15,6 +15,7 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/EphemeralValuesCache.h"
 #include "llvm/Analysis/IR2Vec.h"
 #include "llvm/Analysis/InlineCost.h"
@@ -29,6 +30,9 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Analysis/ConstrainedOptimization.h"
+#include "llvm/Analysis/CoptNativePolicy.h" // copt_impl: ADDED
+#include "llvm/Support/FormatVariadic.h" // copt_impl: ADDED
 
 using namespace llvm;
 #define DEBUG_TYPE "inline"
@@ -181,7 +185,37 @@ std::optional<llvm::InlineCost> static getDefaultInlineAdvice(
 
 std::unique_ptr<InlineAdvice>
 DefaultInlineAdvisor::getAdviceImpl(CallBase &CB) {
+  // COPT_NATIVE_REGIONAL_V1: BEGIN inline native-policy override
+  CoptNativePolicy &CoptNative = CoptNativePolicy::get();
+  std::string CoptNativeRegionID = CoptNative.inlineRegionID(CB);
+  bool CoptNativeO2 = CoptNative.useO2ForInline(CB);
+  CoptScopedO2Policy CoptNativeScope(*CB.getCaller(), CoptNativeO2);
+
+  // LLVM still owns the actual inline decision.  The only change is that an
+  // explicitly promoted callsite is evaluated as if its caller were O2 rather
+  // than optsize/minsize.
   auto OIC = getDefaultInlineAdvice(CB, FAM, Params);
+
+  int CoptNativeCost = 0;
+  int CoptNativeThreshold = 0;
+  if (OIC && OIC->isVariable()) {
+    CoptNativeCost = OIC->getCost();
+    CoptNativeThreshold = OIC->getThreshold();
+  }
+
+  // Reuse LLVM's existing BFI/SamplePGO information.  COPT does not invent a
+  // separate regional hotness model.
+  double CoptNativeProfileCount = 0.0;
+  auto &CoptNativeBFI =
+      FAM.getResult<BlockFrequencyAnalysis>(*CB.getCaller());
+  if (auto Count = CoptNativeBFI.getBlockProfileCount(
+          CB.getParent(), /*AllowSynthetic=*/true))
+    CoptNativeProfileCount = static_cast<double>(*Count);
+
+  CoptNative.traceInline(CB, CoptNativeRegionID, OIC.has_value(),
+                         CoptNativeProfileCount, CoptNativeCost,
+                         CoptNativeThreshold);
+  // COPT_NATIVE_REGIONAL_V1: END inline native-policy override
   return std::make_unique<DefaultInlineAdvice>(
       this, CB, OIC,
       FAM.getResult<OptimizationRemarkEmitterAnalysis>(*CB.getCaller()));
@@ -419,11 +453,97 @@ llvm::shouldInline(CallBase &CB, TargetTransformInfo &CalleeTTI,
   Function *Callee = CB.getCalledFunction();
   Function *Caller = CB.getCaller();
 
+  // copt_impl: BEGIN
+  CoptContext &COPT = CoptContext::get();
+
+  std::string CoptID;
+
+  if (COPT.active() && IC.isVariable() && Callee) {
+    CoptID = COPT.makeInstructionID(
+        CoptKind::Inline, CB, Callee->getName());
+  }
+
+  auto ReportCoptCandidate = [&](bool DefaultInline) {
+    if (!COPT.isDiscover() || CoptID.empty())
+      return;
+
+    CoptCandidate C;
+    C.ID = CoptID;
+    C.Kind = CoptKind::Inline;
+    C.Function = Caller->getName().str();
+    C.Stage = "full-lto-inline";
+
+    C.RegionKind = CoptRegionKind::CallSite;
+
+    C.RegionID =
+        COPT.getOrCreateInstructionRegionID(
+            CoptRegionKind::CallSite,
+            CB,
+            Callee->getName());
+
+    COPT.populateInstructionProvenance(C, CB);
+
+    if (DebugLoc DL = CB.getDebugLoc())
+      C.Location =
+          formatv("{0}:{1}", DL.getLine(), DL.getCol()).str();
+
+    CoptAlternative NoInline;
+    NoInline.Name = "no-inline";
+    NoInline.LLVMDefault = !DefaultInline;
+    NoInline.LowerEndpoint = true;
+
+    // If the upper/reference pipeline also declines this inline, then lower and
+    // upper are the same state for this callsite.
+    NoInline.UpperEndpoint = !DefaultInline;
+
+    CoptAlternative Inline;
+    Inline.Name = "inline";
+    Inline.LLVMDefault = DefaultInline;
+    Inline.UpperEndpoint = DefaultInline;
+
+    // We deliberately do not make a rejected upper-pipeline inline a selectable
+    // intermediate state. Milestone 3 searches between the conservative state and
+    // the actually selected upper/reference state; it does not go beyond O2/O3.
+    Inline.Replayable = DefaultInline;
+
+    Inline.Metrics["inline_cost"] =
+        static_cast<double>(IC.getCost());
+    Inline.Metrics["inline_threshold"] =
+        static_cast<double>(IC.getThreshold());
+    Inline.Metrics["inline_cost_delta"] =
+        static_cast<double>(IC.getCostDelta());
+
+    C.Alternatives.push_back(std::move(NoInline));
+    C.Alternatives.push_back(std::move(Inline));
+
+    COPT.report(std::move(C));
+  };
+
+  // Mandatory inline. COPT must not override this.
   if (IC.isAlways()) {
     LLVM_DEBUG(dbgs() << "    Inlining " << inlineCostStr(IC)
                       << ", Call: " << CB << "\n");
     return IC;
   }
+
+  // COPT apply override.
+  // We only reach this block for variable-cost decisions. "Always" and
+  // "Never" decisions remain LLVM's responsibility.
+  if (COPT.isApply() && !CoptID.empty()) {
+    if (auto Choice = COPT.selection(CoptID)) {
+      if (*Choice == "no-inline") {
+        COPT.noteApplied(CoptID, "no-inline");
+        return std::nullopt;
+      }
+
+      if (*Choice == "inline") {
+        COPT.noteApplied(CoptID, "inline");
+        return InlineCost::getAlways("copt-selected",
+                                     IC.getCostBenefit());
+      }
+    }
+  }
+  // copt_impl: END
 
   if (!IC) {
     LLVM_DEBUG(dbgs() << "    NOT Inlining " << inlineCostStr(IC)
@@ -463,6 +583,8 @@ llvm::shouldInline(CallBase &CB, TargetTransformInfo &CalleeTTI,
     setInlineRemark(CB, "deferred");
     return std::nullopt;
   }
+
+  ReportCoptCandidate(/*DefaultInline=*/true); // copt_impl: ADDED
 
   LLVM_DEBUG(dbgs() << "    Inlining " << inlineCostStr(IC) << ", Call: " << CB
                     << '\n');

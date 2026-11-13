@@ -32,7 +32,14 @@
 #include "llvm/Support/RandomNumberGenerator.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/xxhash.h"
+
+#include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/JSON.h"
+
 #include <climits>
+
+#include <cstdlib>
+#include <optional>
 
 #define DEBUG_TYPE "lld"
 
@@ -46,6 +53,184 @@ using namespace lld::elf;
 
 namespace {
 // The writer writes a SymbolTable result to a file.
+
+struct CoptLinkedSize {
+  uint64_t Text = 0;
+  uint64_t Data = 0;
+  uint64_t Bss = 0;
+
+  uint64_t flashBytes() const {
+    return Text + Data;
+  }
+};
+
+static std::optional<uint64_t>
+getCoptLinkUInt64Env(
+    Ctx &ctx,
+    const char *Name) {
+
+  const char *Raw =
+      std::getenv(Name);
+
+  if (!Raw)
+    return std::nullopt;
+
+  StringRef S(Raw);
+
+  uint64_t Value = 0;
+
+  if (S.getAsInteger(
+          10,
+          Value)) {
+    Err(ctx)
+        << "COPT: invalid unsigned integer for "
+        << Name
+        << ": "
+        << Raw;
+
+    return std::nullopt;
+  }
+
+  return Value;
+}
+
+static CoptLinkedSize
+computeCoptLinkedSize(
+    Ctx &ctx) {
+
+  CoptLinkedSize Result;
+
+  for (OutputSection *Sec :
+       ctx.outputSections) {
+
+    // Berkeley llvm-size only counts allocatable sections in the text/data/bss
+    // buckets.
+    if (!(Sec->flags & SHF_ALLOC))
+      continue;
+
+    if (Sec->type == SHT_NOBITS) {
+      Result.Bss += Sec->size;
+      continue;
+    }
+
+    if (Sec->flags & SHF_WRITE)
+      Result.Data += Sec->size;
+    else
+      Result.Text += Sec->size;
+  }
+
+  return Result;
+}
+
+static void
+writeCoptLinkedSizeReport(
+    Ctx &ctx,
+    StringRef Path,
+    const CoptLinkedSize &Size,
+    std::optional<uint64_t> MaxBytes,
+    bool WithinBudget) {
+
+  if (Path.empty())
+    return;
+
+  json::Object Root;
+
+  Root["version"] = 1;
+  Root["metric"] =
+      "elf-berkeley-text-plus-data";
+
+  Root["text_bytes"] =
+      static_cast<int64_t>(
+          Size.Text);
+
+  Root["data_bytes"] =
+      static_cast<int64_t>(
+          Size.Data);
+
+  Root["bss_bytes"] =
+      static_cast<int64_t>(
+          Size.Bss);
+
+  Root["flash_bytes"] =
+      static_cast<int64_t>(
+          Size.flashBytes());
+
+  if (MaxBytes)
+    Root["max_bytes"] =
+        static_cast<int64_t>(
+            *MaxBytes);
+
+  Root["within_budget"] =
+      WithinBudget;
+
+  std::error_code EC;
+
+  raw_fd_ostream OS(
+      Path,
+      EC,
+      sys::fs::OF_Text);
+
+  if (EC) {
+    Err(ctx)
+        << "COPT: cannot write linked-size report '"
+        << Path
+        << "': "
+        << EC.message();
+
+    return;
+  }
+
+  OS << formatv(
+      "{0:2}\n",
+      json::Value(std::move(Root)));
+}
+
+static void
+checkCoptLinkedSizeBudget(
+    Ctx &ctx) {
+
+  std::optional<uint64_t> MaxBytes =
+      getCoptLinkUInt64Env(
+          ctx,
+          "COPT_MAX_SIZE_BYTES");
+
+  const char *ReportPath =
+      std::getenv(
+          "COPT_LINK_SIZE_REPORT");
+
+  // Do nothing for ordinary links.
+  if (!MaxBytes && !ReportPath)
+    return;
+
+  CoptLinkedSize Size =
+      computeCoptLinkedSize(ctx);
+
+  const bool WithinBudget =
+      !MaxBytes ||
+      Size.flashBytes() <= *MaxBytes;
+
+  if (ReportPath)
+    writeCoptLinkedSizeReport(
+        ctx,
+        ReportPath,
+        Size,
+        MaxBytes,
+        WithinBudget);
+
+  if (!WithinBudget) {
+    Err(ctx)
+        << "COPT linked-size budget exceeded: "
+        << Size.flashBytes()
+        << " bytes (text="
+        << Size.Text
+        << ", data="
+        << Size.Data
+        << "), limit="
+        << *MaxBytes
+        << " bytes";
+  }
+}
+
 template <class ELFT> class Writer {
 public:
   LLVM_ELF_IMPORT_TYPES_ELFT(ELFT)
@@ -345,6 +530,20 @@ template <class ELFT> void Writer<ELFT>::run() {
 
   for (Partition &part : ctx.partitions)
     setPhdrs(part);
+
+  
+  // copt_impl: BEGIN exact linked-byte enforcement
+  //
+  // At this point:
+  // - output sections have been finalized;
+  // - compressed sections have their final sizes;
+  // - addresses/file offsets have been assigned;
+  // - program headers have been finalized.
+  //
+  // This is late enough to inspect the authoritative output-section sizes,
+  // while still occurring before openFile()/commit.
+  checkCoptLinkedSizeBudget(ctx);
+  // copt_impl: END exact linked-byte enforcement
 
   // Handle --print-map(-M)/--Map and --cref. Dump them before checkSections()
   // because the files may be useful in case checkSections() or openFile()

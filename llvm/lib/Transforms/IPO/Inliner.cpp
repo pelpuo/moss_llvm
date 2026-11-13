@@ -29,6 +29,7 @@
 #include "llvm/Analysis/EphemeralValuesCache.h"
 #include "llvm/Analysis/InlineAdvisor.h"
 #include "llvm/Analysis/InlineCost.h"
+#include "llvm/Analysis/ConstrainedOptimization.h" // copt_impl: ADDED
 #include "llvm/Analysis/LazyCallGraph.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/ProfileSummaryInfo.h"
@@ -377,6 +378,41 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
 
       // Setup the data structure used to plumb customization into the
       // `InlineFunction` routine.
+
+      // copt_impl: BEGIN provenance
+      CoptContext &COPT = CoptContext::get();
+
+      bool CoptTrackInlineOrigin = false;
+      std::string CoptInlineDecisionID;
+      std::string CoptInlineRegionID;
+
+      SmallPtrSet<Instruction *, 32>
+          CoptInstructionsBeforeInline;
+
+      if (COPT.isDiscover()) {
+        CoptInlineDecisionID =
+            COPT.makeInstructionID(
+                CoptKind::Inline,
+                *CB,
+                Callee.getName());
+
+        // Only tag an inline that was actually reported as a COPT candidate.
+        // Mandatory/non-COPT inlines do not become solver dependencies.
+        if (COPT.hasCandidate(CoptInlineDecisionID)) {
+          CoptInlineRegionID =
+              COPT.getOrCreateInstructionRegionID(
+                  CoptRegionKind::CallSite,
+                  *CB,
+                  Callee.getName());
+
+          for (Instruction &Inst : instructions(F))
+            CoptInstructionsBeforeInline.insert(&Inst);
+
+          CoptTrackInlineOrigin = true;
+        }
+      }
+      // copt_impl: END provenance
+      
       InlineFunctionInfo IFI(
           GetAssumptionCache, PSI,
           &FAM.getResult<BlockFrequencyAnalysis>(*(CB->getCaller())),
@@ -390,6 +426,34 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
         Advice->recordUnsuccessfulInlining(IR);
         continue;
       }
+    
+      // copt_impl: BEGIN provenance
+      //
+      // InlineFunction may:
+      // - create cloned callee instructions,
+      // - split caller blocks,
+      // - create branches/PHIs,
+      // - simplify parts of the inline.
+      //
+      // We intentionally compare instruction pointer identity rather than trying to
+      // infer the new region from debug locations.
+      //
+      // Pointers stored in CoptInstructionsBeforeInline may refer to instructions
+      // erased by InlineFunction. We never dereference those pointers; they are used
+      // only as identity values in the set.
+      if (CoptTrackInlineOrigin) {
+        for (Instruction &Inst : instructions(F)) {
+          if (CoptInstructionsBeforeInline.count(&Inst))
+            continue;
+
+          COPT.tagInstructionOrigin(
+              Inst,
+              CoptInlineDecisionID,
+              CoptInlineRegionID);
+        }
+      }
+      // copt_impl: END provenance
+
       // TODO: Shouldn't we be invalidating all analyses on F here?
       // The caller was modified, so invalidate Ephemeral Values.
       FAM.getResult<EphemeralValuesAnalysis>(F).clear();

@@ -141,6 +141,14 @@ struct Spec {
   // Number of instructions in the specialization.
   unsigned CodeSize;
 
+  // copt_impl: BEGIN
+  std::string CoptID;
+
+  unsigned CoptCodeSizeSavings = 0;
+  unsigned CoptLatencySavings = 0;
+  unsigned CoptInliningBonus = 0;
+  // copt_impl: END
+
   // List of call sites, matching this specialization.
   SmallVector<CallBase *> CallSites;
 

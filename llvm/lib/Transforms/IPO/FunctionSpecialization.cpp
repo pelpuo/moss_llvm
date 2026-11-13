@@ -9,6 +9,9 @@
 #include "llvm/Transforms/IPO/FunctionSpecialization.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/CodeMetrics.h"
+#include "llvm/Analysis/ConstrainedOptimization.h" // copt_impl: ADDED
+#include "llvm/Support/raw_ostream.h" // copt_impl: ADDED
+#include "llvm/Support/FormatVariadic.h" // copt_impl: ADDED
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/InlineCost.h"
 #include "llvm/Analysis/InstructionSimplify.h"
@@ -1013,9 +1016,97 @@ bool FunctionSpecializer::findSpecializations(Function *F, unsigned FuncSize,
         return true;
       };
 
-      // Discard unprofitable specialisations.
+ // Discard unprofitable specialisations.
       if (!IsProfitable())
         continue;
+
+      // copt_impl: BEGIN
+      CoptContext &COPT = CoptContext::get();
+
+      std::string CoptID;
+      if (COPT.active()) {
+        std::string Key;
+        raw_string_ostream KeyOS(Key);
+
+        KeyOS << F->getName() << "|";
+        for (const ArgInfo &A : S.Args) {
+          KeyOS << "arg" << A.Formal->getArgNo() << "=";
+          A.Actual->printAsOperand(KeyOS, /*PrintType=*/true);
+          KeyOS << ";";
+        }
+        KeyOS.flush();
+
+        CoptID =
+            COPT.makeKeyID(CoptKind::FunctionSpecialization, Key);
+
+        COPT.noteSeen(CoptID);
+
+        unsigned LatencySavings =
+            getCostValue(Visitor.getLatencySavingsForKnownConstants());
+
+        CoptCandidate C;
+        C.ID = CoptID;
+        C.Kind = CoptKind::FunctionSpecialization;
+        C.Function = F->getName().str();
+        C.Stage = "full-lto-function-specialization";
+
+        if (COPT.isDiscover()) {
+          C.RegionKind =
+              CoptRegionKind::Function;
+
+          C.RegionID =
+              COPT.makeFunctionRegionID(*F);
+        }
+
+        if (DebugLoc DL = CS.getDebugLoc())
+          C.Location =
+              formatv("{0}:{1}", DL.getLine(), DL.getCol()).str();
+
+        CoptAlternative NoSpec;
+        NoSpec.Name = "no-specialize";
+        NoSpec.LLVMDefault = false;
+        NoSpec.LowerEndpoint = true;
+
+        CoptAlternative SpecAlt;
+        SpecAlt.Name = "specialize";
+        SpecAlt.LLVMDefault = true;
+        SpecAlt.UpperEndpoint = true;
+
+        // FunctionSpecialization already computes these values.
+        SpecAlt.PerfBenefit =
+            static_cast<double>(LatencySavings);
+        SpecAlt.SizeCost =
+            static_cast<double>(SpecSize);
+
+        SpecAlt.Metrics["score"] =
+            static_cast<double>(Score);
+        SpecAlt.Metrics["function_size"] =
+            static_cast<double>(FuncSize);
+        SpecAlt.Metrics["specialized_size"] =
+            static_cast<double>(SpecSize);
+        SpecAlt.Metrics["code_size_savings"] =
+            static_cast<double>(CodeSizeSavings);
+        SpecAlt.Metrics["latency_savings"] =
+            static_cast<double>(LatencySavings);
+
+        C.Alternatives.push_back(std::move(NoSpec));
+        C.Alternatives.push_back(std::move(SpecAlt));
+
+        COPT.report(std::move(C));
+
+        if (COPT.isApply()) {
+          if (auto Choice = COPT.selection(CoptID)) {
+            if (*Choice == "no-specialize") {
+              COPT.noteApplied(CoptID, "no-specialize");
+              continue;
+            }
+
+            if (*Choice == "specialize")
+              COPT.noteApplied(CoptID, "specialize");
+          }
+        }
+      }
+      // copt_impl: END
 
       // Create a new specialisation entry.
       auto &Spec = AllSpecs.emplace_back(F, S, Score, SpecSize);

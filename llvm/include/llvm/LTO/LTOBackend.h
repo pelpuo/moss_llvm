@@ -43,6 +43,11 @@ LLVM_ABI bool opt(const Config &Conf, TargetMachine *TM, unsigned Task,
 
 /// Runs a regular LTO backend. The regular LTO backend can also act as the
 /// regular LTO phase of ThinLTO, which may need to access the combined index.
+/// COPT v4.1: rewrite deferred regular-LTO input before irsymtab.
+LLVM_ABI Expected<std::unique_ptr<MemoryBuffer>>
+coptPreprocessRegularLTOInput(MemoryBufferRef Object);
+// COPT_INTERNAL_PREIRSYMTAB_V41333333
+
 LLVM_ABI Error backend(const Config &C, AddStreamFn AddStream,
                        unsigned ParallelCodeGenParallelismLevel, Module &M,
                        ModuleSummaryIndex &CombinedIndex);

@@ -43,8 +43,51 @@
 #include "llvm/TargetParser/SubtargetFeature.h"
 #include "llvm/Transforms/IPO/WholeProgramDevirt.h"
 #include "llvm/Transforms/Utils/FunctionImportUtils.h"
+#include "llvm/Analysis/ConstrainedOptimization.h" // copt_impl: ADDED
+#include "llvm/Transforms/Utils/Cloning.h" // copt_impl: ADDED
 #include "llvm/Transforms/Utils/SplitModule.h"
+#include "llvm/Analysis/BlockFrequencyInfo.h"
+#include "llvm/Analysis/CoptFunctionPlans.h"
+#include "llvm/Analysis/CoptSolver.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/JSON.h"
+
+#include "llvm/Analysis/InlineCost.h"
+#include "llvm/Analysis/ProfileSummaryInfo.h"
+#include "llvm/IR/Attributes.h"
+#include "llvm/IR/InstIterator.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/Transforms/IPO/Inliner.h"
+
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar/ADCE.h"
+#include "llvm/Transforms/Scalar/LoopInstSimplify.h"
+#include "llvm/Transforms/Scalar/LoopPassManager.h"
+#include "llvm/Transforms/Scalar/LoopSimplifyCFG.h"
+#include "llvm/Transforms/Scalar/LoopUnrollPass.h"
+#include "llvm/Transforms/Scalar/SimpleLoopUnswitch.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include "llvm/Transforms/Vectorize/LoopVectorize.h"
+
+#include "llvm/Analysis/InlineCost.h"
+#include "llvm/Analysis/ProfileSummaryInfo.h"
+#include "llvm/IR/Attributes.h"
+#include "llvm/IR/InstIterator.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/Transforms/IPO/Inliner.h"
+
+#include <cerrno>
+#include <cmath>
+#include <cstdlib>
+#include <string>
+#include <system_error>
+#include <unordered_map>
 #include <optional>
+#include <unordered_set>
+
+#include <algorithm>
 
 using namespace llvm;
 using namespace lto;
@@ -236,7 +279,11 @@ createTargetMachine(const Config &Conf, const Target *TheTarget, Module &M) {
   return TM;
 }
 
-static void runNewPMPasses(const Config &Conf, Module &Mod, TargetMachine *TM,
+// COPT_INTERNAL_LTO_V2: BEGIN
+static void registerCoptInternalPolicyCallbacks(PassBuilder &PB);
+// COPT_INTERNAL_LTO_V2: END forward declaration
+
+static void runNewPMPassesOnce(const Config &Conf, Module &Mod, TargetMachine *TM,
                            unsigned OptLevel, bool IsThinLTO,
                            ModuleSummaryIndex *ExportSummary,
                            const ModuleSummaryIndex *ImportSummary) {
@@ -274,6 +321,10 @@ static void runNewPMPasses(const Config &Conf, Module &Mod, TargetMachine *TM,
                               Conf.VerifyEach);
   SI.registerCallbacks(PIC, &MAM);
   PassBuilder PB(TM, Conf.PTO, PGOOpt, &PIC);
+
+  // COPT internal policy must register before external pass plugins so its
+  // function attributes are available at Full-LTO extension points.
+  registerCoptInternalPolicyCallbacks(PB);
 
   RegisterPassPlugins(Conf.PassPlugins, PB);
 
@@ -352,6 +403,1262 @@ static void runNewPMPasses(const Config &Conf, Module &Mod, TargetMachine *TM,
 
   MPM.run(Mod, MAM);
 }
+
+// COPT_INTERNAL_LTO_V2: internal shadow planner wrapper.
+#define COPT_INTERNAL_V2_HAS_BITCODE_LIBFUNCS 0
+#include "CoptInternalLTO.inc"
+#undef COPT_INTERNAL_V2_HAS_BITCODE_LIBFUNCS
+// COPT_INTERNAL_LTO_V2: END
+
+
+// COPT_PROFILE_UTILITY_V2
+//
+// IMPORTANT:
+//   SizeCost and PerfCost below are diagnostic/static-model quantities.
+//   PerfCost is NOT used as the global optimization objective anymore.
+//
+// Global value is driven by profile hotness:
+//   utility(plan) = normalized function entry hotness * plan aggressiveness.
+//
+// The hard size constraint remains the real linked-byte check in LLD.
+// TTI CodeSize remains only a cheap internal size estimator used to shortlist
+// and refine candidates before the authoritative linked-size check.
+struct CoptFunctionScore {
+  double SizeCost = 0.0;
+
+  // Retained only for diagnostics/evaluation reports.
+  double PerfCost = 0.0;
+
+  // SamplePGO/BFI-derived function-entry execution importance.
+  double Hotness = 0.0;
+
+  uint64_t InstructionCount = 0;
+};
+
+struct CoptModuleScore {
+  double SizeCost = 0.0;
+
+  // Diagnostic only.
+  double PerfCost = 0.0;
+
+  // Sum of per-function entry hotness. Used to normalize values to [0, 1].
+  double TotalHotness = 0.0;
+
+  uint64_t InstructionCount = 0;
+  uint64_t ProfiledBlocks = 0;
+  uint64_t FallbackBlocks = 0;
+
+  std::unordered_map<
+      std::string,
+      CoptFunctionScore>
+      Functions;
+};
+
+static CoptModuleScore
+scoreCoptModule(
+    Module &M,
+    TargetMachine *TM) {
+
+  PassBuilder PB(TM);
+
+  LoopAnalysisManager LAM;
+  FunctionAnalysisManager FAM;
+  CGSCCAnalysisManager CGAM;
+  ModuleAnalysisManager MAM;
+
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+
+  PB.crossRegisterProxies(
+      LAM,
+      FAM,
+      CGAM,
+      MAM);
+
+  CoptModuleScore Result;
+
+  for (Function &F : M) {
+    if (F.isDeclaration() ||
+        F.empty())
+      continue;
+
+    auto &TTI =
+        FAM.getResult<TargetIRAnalysis>(F);
+
+    auto &BFI =
+        FAM.getResult<BlockFrequencyAnalysis>(F);
+
+    CoptFunctionScore &FunctionScore =
+        Result.Functions[
+            F.getName().str()];
+
+    // --------------------------------------------------------------------
+    // Profile hotness
+    // --------------------------------------------------------------------
+    //
+    // Prefer the SamplePGO/synthetic profile count of the function entry.
+    // This answers "how dynamically important is this function?" separately
+    // from LLVM's static instruction cost estimates.
+    const BasicBlock &Entry =
+        F.getEntryBlock();
+
+    const uint64_t EntryFreq =
+        std::max<uint64_t>(
+            1,
+            BFI.getBlockFreq(
+                   &Entry)
+                .getFrequency());
+
+    double EntryCountScale =
+        1.0;
+
+    if (std::optional<uint64_t> EntryCount =
+            BFI.getBlockProfileCount(
+                &Entry,
+                /*AllowSynthetic=*/true))
+      EntryCountScale =
+          std::max(
+              1.0,
+              static_cast<double>(
+                  *EntryCount));
+
+    FunctionScore.Hotness =
+        EntryCountScale;
+
+    Result.TotalHotness +=
+        EntryCountScale;
+
+    // --------------------------------------------------------------------
+    // Diagnostic TTI totals + cheap size estimator
+    // --------------------------------------------------------------------
+    //
+    // TCK_CodeSize is only a shortlist/refinement estimate.
+    // TCK_RecipThroughput is retained only for diagnostics.
+    for (BasicBlock &BB : F) {
+      double Weight = 0.0;
+
+      if (std::optional<uint64_t> Count =
+              BFI.getBlockProfileCount(
+                  &BB,
+                  /*AllowSynthetic=*/true)) {
+
+        Weight =
+            static_cast<double>(
+                *Count);
+
+        ++Result.ProfiledBlocks;
+      } else {
+
+        const uint64_t BBFreq =
+            BFI.getBlockFreq(
+                   &BB)
+                .getFrequency();
+
+        const double RelativeFreq =
+            static_cast<double>(
+                BBFreq) /
+            static_cast<double>(
+                EntryFreq);
+
+        Weight =
+            EntryCountScale *
+            RelativeFreq;
+
+        ++Result.FallbackBlocks;
+      }
+
+      for (Instruction &I : BB) {
+        ++Result.InstructionCount;
+        ++FunctionScore.InstructionCount;
+
+        InstructionCost Size =
+            TTI.getInstructionCost(
+                &I,
+                TargetTransformInfo::TCK_CodeSize);
+
+        const double SizeValue =
+            Size.isValid()
+                ? static_cast<double>(
+                      Size.getValue())
+                : 1.0;
+
+        Result.SizeCost +=
+            SizeValue;
+
+        FunctionScore.SizeCost +=
+            SizeValue;
+
+        InstructionCost Perf =
+            TTI.getInstructionCost(
+                &I,
+                TargetTransformInfo::TCK_RecipThroughput);
+
+        const double PerfValue =
+            Perf.isValid()
+                ? static_cast<double>(
+                      Perf.getValue())
+                : 1.0;
+
+        const double WeightedPerf =
+            PerfValue *
+            Weight;
+
+        Result.PerfCost +=
+            WeightedPerf;
+
+        FunctionScore.PerfCost +=
+            WeightedPerf;
+      }
+    }
+  }
+
+  return Result;
+}
+
+
+static const CoptFunctionScore &
+getCoptFunctionScoreOrZero(
+    const CoptModuleScore &Score,
+    StringRef FunctionName) {
+
+  static const CoptFunctionScore Zero;
+
+  auto It =
+      Score.Functions.find(
+          FunctionName.str());
+
+  if (It == Score.Functions.end())
+    return Zero;
+
+  return It->second;
+}
+
+using CoptCandidateIndex =
+    std::unordered_map<
+        std::string,
+        const CoptCandidate *>;
+
+static CoptCandidateIndex
+buildCoptCandidateIndex(
+    ArrayRef<CoptCandidate> Candidates) {
+
+  CoptCandidateIndex Index;
+
+  Index.reserve(
+      Candidates.size());
+
+  for (const CoptCandidate &C :
+       Candidates)
+    Index.emplace(
+        C.ID,
+        &C);
+
+  return Index;
+}
+
+static const CoptCandidate *
+findCoptCandidateByID(
+    const CoptCandidateIndex &Index,
+    const std::string &ID) {
+
+  auto It =
+      Index.find(ID);
+
+  if (It ==
+      Index.end())
+    return nullptr;
+
+  return It->second;
+}
+
+static const CoptAlternative *
+findCoptStateByName(
+    const CoptCandidate &C,
+    StringRef Name) {
+
+  for (const CoptAlternative &A :
+       C.Alternatives)
+    if (A.Name == Name)
+      return &A;
+
+  return nullptr;
+}
+
+static double
+coptDecisionAggressiveness(
+    const CoptCandidate &C,
+    StringRef StateName) {
+
+  const CoptAlternative *Selected =
+      findCoptStateByName(
+          C,
+          StateName);
+
+  if (!Selected)
+    return 0.0;
+
+  if (Selected->LowerEndpoint)
+    return 0.0;
+
+  if (Selected->UpperEndpoint)
+    return 1.0;
+
+  const CoptAlternative *Lower =
+      nullptr;
+
+  const CoptAlternative *Upper =
+      nullptr;
+
+  for (const CoptAlternative &A :
+       C.Alternatives) {
+
+    if (!A.Replayable)
+      continue;
+
+    if (A.LowerEndpoint)
+      Lower = &A;
+
+    if (A.UpperEndpoint)
+      Upper = &A;
+  }
+
+  if (!Lower || !Upper)
+    return 0.0;
+
+  auto MetricFraction =
+      [&](StringRef Metric)
+          -> std::optional<double> {
+
+    auto LI =
+        Lower->Metrics.find(
+            Metric.str());
+
+    auto UI =
+        Upper->Metrics.find(
+            Metric.str());
+
+    auto SI =
+        Selected->Metrics.find(
+            Metric.str());
+
+    if (LI == Lower->Metrics.end() ||
+        UI == Upper->Metrics.end() ||
+        SI == Selected->Metrics.end())
+      return std::nullopt;
+
+    const double Den =
+        UI->second -
+        LI->second;
+
+    if (std::abs(Den) < 1.0e-12)
+      return std::nullopt;
+
+    return std::clamp(
+        (SI->second -
+         LI->second) /
+            Den,
+        0.0,
+        1.0);
+  };
+
+  if (auto F =
+          MetricFraction(
+              "unroll_count"))
+    return *F;
+
+  if (auto F =
+          MetricFraction(
+              "vf"))
+    return *F;
+
+  std::vector<const CoptAlternative *>
+      Replayable;
+
+  for (const CoptAlternative &A :
+       C.Alternatives)
+    if (A.Replayable)
+      Replayable.push_back(&A);
+
+  if (Replayable.size() < 2)
+    return 0.0;
+
+  size_t LowerIndex =
+      0;
+
+  size_t UpperIndex =
+      Replayable.size() - 1;
+
+  size_t SelectedIndex =
+      0;
+
+  for (size_t I = 0;
+       I < Replayable.size();
+       ++I) {
+
+    if (Replayable[I]->LowerEndpoint)
+      LowerIndex = I;
+
+    if (Replayable[I]->UpperEndpoint)
+      UpperIndex = I;
+
+    if (Replayable[I]->Name ==
+        StateName)
+      SelectedIndex = I;
+  }
+
+  if (UpperIndex == LowerIndex)
+    return 0.0;
+
+  return std::clamp(
+      static_cast<double>(
+          SelectedIndex - LowerIndex) /
+          static_cast<double>(
+              UpperIndex - LowerIndex),
+      0.0,
+      1.0);
+}
+
+static double
+coptPlanAggressiveness(
+    const CoptFunctionPlan &Plan,
+    const CoptCandidateIndex &CandidateByID) {
+
+  if (Plan.IsLowerEndpoint)
+    return 0.0;
+
+  if (Plan.IsUpperEndpoint)
+    return 1.0;
+
+  if (Plan.Choices.empty())
+    return 0.0;
+
+  double Sum = 0.0;
+  unsigned Count = 0;
+
+  for (const CoptPlanChoice &Choice :
+       Plan.Choices) {
+
+    const CoptCandidate *C =
+        findCoptCandidateByID(
+            CandidateByID,
+            Choice.DecisionID);
+
+    if (!C)
+      continue;
+
+    Sum +=
+        coptDecisionAggressiveness(
+            *C,
+            Choice.State);
+
+    ++Count;
+  }
+
+  if (Count == 0)
+    return 0.0;
+
+  return std::clamp(
+      Sum /
+          static_cast<double>(Count),
+      0.0,
+      1.0);
+}
+
+static std::vector<CoptPlanValue>
+buildInitialCoptPlanValues(
+    ArrayRef<CoptFunctionPlan> Plans,
+    ArrayRef<CoptCandidate> Candidates,
+    const CoptModuleScore &Lower,
+    const CoptModuleScore &Upper) {
+
+  std::vector<CoptPlanValue> Values;
+  Values.reserve(Plans.size());
+
+  const CoptCandidateIndex CandidateByID =
+      buildCoptCandidateIndex(
+          Candidates);
+
+  const double ModuleHotness =
+      std::max(
+          Lower.TotalHotness,
+          1.0);
+
+  for (const CoptFunctionPlan &Plan :
+       Plans) {
+
+    CoptPlanValue V;
+
+    V.Function =
+        Plan.Function;
+
+    V.PlanID =
+        Plan.ID;
+
+    V.LowerEndpoint =
+        Plan.IsLowerEndpoint;
+
+    V.UpperEndpoint =
+        Plan.IsUpperEndpoint;
+
+    if (Plan.IsLowerEndpoint) {
+      V.SizeDelta = 0.0;
+      V.PerformanceBenefit = 0.0;
+      V.Exact = true;
+
+      Values.push_back(
+          std::move(V));
+
+      continue;
+    }
+
+    const CoptFunctionScore &LowerF =
+        getCoptFunctionScoreOrZero(
+            Lower,
+            Plan.Function);
+
+    const CoptFunctionScore &UpperF =
+        getCoptFunctionScoreOrZero(
+            Upper,
+            Plan.Function);
+
+    const double UpperSizeDelta =
+        UpperF.SizeCost -
+        LowerF.SizeCost;
+
+    const double Alpha =
+        coptPlanAggressiveness(
+            Plan,
+            CandidateByID);
+
+    // Cost-model v2:
+    // LLVM's upper/reference pipeline supplies the native aggressive states.
+    // COPT values those states by where the dynamic execution actually is,
+    // instead of translating IR reciprocal-throughput sums into "speed".
+    //
+    // U(plan) =
+    //   normalized function-entry SamplePGO/BFI hotness
+    //   * native-plan aggressiveness.
+    const double FunctionHotness =
+        std::max(
+            LowerF.Hotness,
+            0.0) /
+        ModuleHotness;
+
+    V.PerformanceBenefit =
+        FunctionHotness *
+        Alpha;
+
+    // Cheap size estimate for exploration. Exact probes refine this static
+    // estimate; the final LLD linked-byte check remains authoritative.
+    V.SizeDelta =
+        Alpha *
+        UpperSizeDelta;
+
+    V.Exact = false;
+
+    Values.push_back(
+        std::move(V));
+  }
+
+  return Values;
+}
+
+static CoptPlanValue *
+findCoptPlanValue(
+    std::vector<CoptPlanValue> &Values,
+    StringRef Function,
+    StringRef PlanID) {
+
+  for (CoptPlanValue &V :
+       Values)
+    if (V.Function == Function &&
+        V.PlanID == PlanID)
+      return &V;
+
+  return nullptr;
+}
+
+static std::optional<double>
+getCoptDoubleEnv(
+    const char *Name) {
+
+  const char *Raw =
+      std::getenv(Name);
+
+  if (!Raw)
+    return std::nullopt;
+
+  errno = 0;
+
+  char *End = nullptr;
+
+  double Value =
+      std::strtod(
+          Raw,
+          &End);
+
+  if (errno != 0 ||
+      End == Raw ||
+      *End != '\0' ||
+      !std::isfinite(Value))
+    report_fatal_error(
+        Twine("COPT: invalid floating-point value for ") +
+        Name);
+
+  return Value;
+}
+
+static unsigned
+getCoptUnsignedEnv(
+    const char *Name,
+    unsigned DefaultValue) {
+
+  const char *Raw =
+      std::getenv(Name);
+
+  if (!Raw)
+    return DefaultValue;
+
+  StringRef S(Raw);
+
+  unsigned Value = 0;
+
+  if (S.getAsInteger(
+          10,
+          Value))
+    report_fatal_error(
+        Twine("COPT: invalid unsigned integer for ") +
+        Name);
+
+  return Value;
+}
+
+static std::optional<uint64_t>
+getCoptUInt64Env(
+    const char *Name) {
+
+  const char *Raw =
+      std::getenv(Name);
+
+  if (!Raw)
+    return std::nullopt;
+
+  StringRef S(Raw);
+
+  uint64_t Value = 0;
+
+  if (S.getAsInteger(
+          10,
+          Value))
+    report_fatal_error(
+        Twine("COPT: invalid unsigned 64-bit integer for ") +
+        Name);
+
+  return Value;
+}
+
+
+// copt_impl: BEGIN
+// ============================================================================
+// COPT Oz-base -> selective local O3 delta helpers
+//
+// Replace the previous COPT helper block beginning with:
+//
+//   using CoptFunctionSet =
+//
+// and ending at the closing brace of:
+//
+//   runCoptO3UpgradePipeline(...)
+//
+// with this entire block.
+//
+// This version intentionally DOES NOT call:
+//   PB.buildModuleSimplificationPipeline(...)
+//   PB.buildModuleOptimizationPipeline(...)
+//
+// Function specialization is temporarily excluded from the delta pipeline.
+// The active target-delta transformations in this correctness-first version are:
+//   * selective O3 inlining
+//   * non-trivial loop unswitching
+//   * loop vectorization
+//   * loop unrolling
+//   * local cleanup
+// ============================================================================
+
+using CoptFunctionSet =
+    std::unordered_set<std::string>;
+
+static CoptFunctionSet
+collectAllCoptDefinedFunctions(
+    Module &M) {
+
+  CoptFunctionSet Result;
+
+  for (Function &F : M) {
+    if (F.isDeclaration() ||
+        F.empty())
+      continue;
+
+    Result.insert(
+        F.getName().str());
+  }
+
+  return Result;
+}
+
+static CoptFunctionSet
+collectCoptUpgradeFunctions(
+    ArrayRef<CoptCandidate> Candidates,
+    const std::unordered_map<
+        std::string,
+        std::string> &Choices) {
+
+  CoptFunctionSet Result;
+
+  for (const CoptCandidate &Candidate :
+       Candidates) {
+
+    auto ChoiceIt =
+        Choices.find(
+            Candidate.ID);
+
+    // Missing means conservative/lower.  This is important when a replay
+    // pipeline exposes a decision that was not part of the discovery plan.
+    if (ChoiceIt ==
+        Choices.end())
+      continue;
+
+    const CoptAlternative *Chosen =
+        nullptr;
+
+    for (const CoptAlternative &Alt :
+         Candidate.Alternatives) {
+      if (Alt.Name ==
+          ChoiceIt->second) {
+        Chosen = &Alt;
+        break;
+      }
+    }
+
+    if (!Chosen)
+      report_fatal_error(
+          Twine(
+              "COPT: plan requests unknown state '") +
+          ChoiceIt->second +
+          "' for candidate " +
+          Candidate.ID);
+
+    if (!Chosen->LowerEndpoint)
+      Result.insert(
+          Candidate.Function);
+  }
+
+  return Result;
+}
+
+static void
+prepareCoptSelectedFunctionsForO3(
+    Module &M,
+    const CoptFunctionSet &Selected) {
+
+  for (const std::string &Name :
+       Selected) {
+
+    Function *F =
+        M.getFunction(Name);
+
+    if (!F ||
+        F->isDeclaration())
+      continue;
+
+    // The module was produced by -Oz.  Selected functions are being promoted
+    // toward the O3 target policy, so remove only the compiler's size-policy
+    // attributes.  Preserve semantic/user attributes such as noinline/optnone.
+    F->removeFnAttr(
+        Attribute::OptimizeForSize);
+
+    F->removeFnAttr(
+        Attribute::MinSize);
+  }
+}
+
+static unsigned
+blockCoptInliningFromUnselectedCallers(
+    Module &M,
+    const CoptFunctionSet &Selected) {
+
+  static constexpr StringLiteral
+      TempNoInlineMD =
+          "copt.ozbase.temp.noinline";
+
+  unsigned Added = 0;
+
+  MDNode *Tag =
+      MDNode::get(
+          M.getContext(),
+          {});
+
+  for (Function &F : M) {
+    if (F.isDeclaration() ||
+        F.empty() ||
+        Selected.count(
+            F.getName().str()) != 0)
+      continue;
+
+    for (Instruction &I :
+         instructions(F)) {
+
+      auto *CB =
+          dyn_cast<CallBase>(&I);
+
+      if (!CB ||
+          CB->isNoInline())
+        continue;
+
+      // Inlining is controlled by caller.  An upgraded caller may use the O3
+      // policy, but an unselected caller must remain at the already-produced
+      // Oz baseline.
+      CB->addFnAttr(
+          Attribute::NoInline);
+
+      CB->setMetadata(
+          TempNoInlineMD,
+          Tag);
+
+      ++Added;
+    }
+  }
+
+  return Added;
+}
+
+static void
+removeCoptTemporaryNoInline(
+    Module &M) {
+
+  static constexpr StringLiteral
+      TempNoInlineMD =
+          "copt.ozbase.temp.noinline";
+
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+
+    for (Instruction &I :
+         instructions(F)) {
+
+      auto *CB =
+          dyn_cast<CallBase>(&I);
+
+      if (!CB ||
+          !CB->getMetadata(
+              TempNoInlineMD))
+        continue;
+
+      CB->removeFnAttr(
+          Attribute::NoInline);
+
+      CB->setMetadata(
+          TempNoInlineMD,
+          nullptr);
+    }
+  }
+}
+
+static FunctionPassManager
+buildCoptO3LocalDeltaPipeline(
+    const PipelineTuningOptions &PTO) {
+
+  FunctionPassManager FPM;
+
+  // Minimal local canonicalization.  Do not replay the complete O3 function
+  // pipeline: the point is to expose only COPT-controlled target deltas on top
+  // of an already-optimized Oz function.
+  FPM.addPass(
+      InstCombinePass());
+
+  // O3-only non-trivial unswitching.  This is a Loop pass, so run it through
+  // the normal loop adaptor with MemorySSA enabled.
+  LoopPassManager UnswitchLPM;
+
+  UnswitchLPM.addPass(
+      LoopInstSimplifyPass());
+
+  UnswitchLPM.addPass(
+      LoopSimplifyCFGPass());
+
+  UnswitchLPM.addPass(
+      SimpleLoopUnswitchPass(
+          /*NonTrivial=*/true));
+
+  FPM.addPass(
+      createFunctionToLoopPassAdaptor(
+          std::move(
+              UnswitchLPM),
+          /*UseMemorySSA=*/true));
+
+  FPM.addPass(
+      SimplifyCFGPass());
+
+  FPM.addPass(
+      InstCombinePass());
+
+  // O3 loop-vectorization policy.
+  //
+  // LoopVectorizeOptions takes "disable" booleans. false/false means allow
+  // vectorization and interleaving.
+  FPM.addPass(
+      LoopVectorizePass(
+          LoopVectorizeOptions(
+              /*InterleaveOnlyWhenForced=*/false,
+              /*VectorizeOnlyWhenForced=*/false)));
+
+  // O3 late unroll policy.  This is the pass containing the COPT multi-state
+  // unroll hook, so evaluation/apply choices remain authoritative.
+  FPM.addPass(
+      LoopUnrollPass(
+          LoopUnrollOptions(
+              /*OptLevel=*/3,
+              /*OnlyWhenForced=*/false,
+              PTO.ForgetAllSCEVInLoopUnroll)));
+
+  // Local cleanup only.  None of these can transform another function.
+  FPM.addPass(
+      InstCombinePass());
+
+  FPM.addPass(
+      SimplifyCFGPass());
+
+  FPM.addPass(
+      ADCEPass());
+
+  return FPM;
+}
+
+static void
+runCoptO3UpgradePipeline(
+    const Config &Conf,
+    Module &M,
+    TargetMachine *TM,
+    const CoptFunctionSet &Selected) {
+
+  if (Selected.empty())
+    return;
+
+  if (!TM)
+    report_fatal_error(
+        "COPT: target machine is null in O3 upgrade pipeline");
+
+  // This is a supplemental delta pipeline over an already-completed Oz
+  // Full-LTO base, not LLVM's normal FullLTOPostLink default pipeline.
+  constexpr ThinOrFullLTOPhase Phase =
+      ThinOrFullLTOPhase::None;
+
+  prepareCoptSelectedFunctionsForO3(
+      M,
+      Selected);
+
+  PipelineTuningOptions PTO =
+      Conf.PTO;
+
+  PTO.LoopInterleaving = true;
+  PTO.LoopVectorization = true;
+  PTO.LoopUnrolling = true;
+
+  // SLP is intentionally excluded until it has a COPT decision hook.
+  PTO.SLPVectorization = false;
+
+  // The Oz base already emitted/updated the call-graph profile.
+  PTO.CallGraphProfile = false;
+
+  PassBuilder PB(
+      TM,
+      PTO);
+
+  LoopAnalysisManager LAM;
+  FunctionAnalysisManager FAM;
+  CGSCCAnalysisManager CGAM;
+  ModuleAnalysisManager MAM;
+
+  PB.registerModuleAnalyses(
+      MAM);
+
+  PB.registerCGSCCAnalyses(
+      CGAM);
+
+  PB.registerFunctionAnalyses(
+      FAM);
+
+  PB.registerLoopAnalyses(
+      LAM);
+
+  PB.crossRegisterProxies(
+      LAM,
+      FAM,
+      CGAM,
+      MAM);
+
+  // ------------------------------------------------------------------------
+  // 1. Selective cross-function inlining.
+  // ------------------------------------------------------------------------
+  //
+  // This is the only module/CGSCC transformation in this correctness-first
+  // delta pipeline.  Calls in every unselected caller are temporarily marked
+  // noinline, so only selected callers can receive O3 inlining decisions.
+  const unsigned BlockedCallsites =
+      blockCoptInliningFromUnselectedCallers(
+          M,
+          Selected);
+
+  InlineParams IP =
+      getInlineParams(
+          /*OptLevel=*/3,
+          /*SizeOptLevel=*/0);
+
+  ModulePassManager InlineMPM;
+
+  InlineMPM.addPass(
+      RequireAnalysisPass<
+          ProfileSummaryAnalysis,
+          Module>());
+
+  InlineMPM.addPass(
+      ModuleInlinerWrapperPass(
+          IP,
+          /*MandatoryFirst=*/false,
+          InlineContext{
+              Phase,
+              InlinePass::CGSCCInliner}));
+
+  InlineMPM.run(
+      M,
+      MAM);
+
+  removeCoptTemporaryNoInline(
+      M);
+
+  // ------------------------------------------------------------------------
+  // 2. Local target-delta passes.
+  // ------------------------------------------------------------------------
+  //
+  // DO NOT use buildModuleSimplificationPipeline/buildModuleOptimizationPipeline
+  // here.  Exact evaluation must not mutate 500+ unrelated functions merely
+  // because one function plan was selected.
+  FunctionPassManager LocalFPM =
+      buildCoptO3LocalDeltaPipeline(
+          PTO);
+
+  unsigned AppliedFunctions = 0;
+
+  for (const std::string &Name :
+       Selected) {
+
+    Function *F =
+        M.getFunction(
+            Name);
+
+    // A selected function may disappear after inlining/DCE in the inliner.
+    if (!F ||
+        F->isDeclaration() ||
+        F->empty())
+      continue;
+
+    LocalFPM.run(
+        *F,
+        FAM);
+
+    ++AppliedFunctions;
+  }
+
+  errs()
+      << "[COPT] local O3 delta: selected="
+      << Selected.size()
+      << ", applied-functions="
+      << AppliedFunctions
+      << ", temporarily-blocked-calls="
+      << BlockedCallsites
+      << "\n";
+}
+
+// copt_impl: END
+
+static std::optional<CoptModuleScore>
+materializeAndScoreCoptChoices(
+    const Config &Conf,
+    Module &Pristine,
+    TargetMachine *TM,
+    unsigned OptLevel,
+    const ModuleSummaryIndex *ImportSummary,
+    const std::unordered_map<
+        std::string,
+        std::string> &Choices) {
+
+  (void)OptLevel;
+  (void)ImportSummary;
+
+  CoptContext &COPT =
+      CoptContext::get();
+
+  // IMPORTANT:
+  //
+  // Pristine is no longer the pre-optimization LTO module. The integrated
+  // wrapper first runs the real Oz base pipeline on Mod. Every call to this
+  // function therefore clones the already-optimized Oz baseline.
+  std::unique_ptr<Module> EvalMod =
+      CloneModule(Pristine);
+
+  CoptFunctionSet SelectedFunctions =
+      collectCoptUpgradeFunctions(
+          COPT.candidates(),
+          Choices);
+
+  COPT.beginIntegratedEvaluation(
+      *EvalMod,
+      Choices);
+
+  // Global-lower has no selected non-lower decision. In that case this is a
+  // pure clone+score operation: no optimizer is run after Oz.
+  if (!SelectedFunctions.empty())
+    runCoptO3UpgradePipeline(
+        Conf,
+        *EvalMod,
+        TM,
+        SelectedFunctions);
+
+  const bool Invalid =
+      COPT.evaluationInvalid();
+
+  const std::string InvalidReason =
+      COPT.evaluationInvalidReason().str();
+
+  COPT.endIntegratedEvaluation(
+      *EvalMod);
+
+  if (Invalid) {
+    errs()
+        << "[COPT] Rejecting non-replayable exact candidate: "
+        << InvalidReason
+        << "\n";
+
+    return std::nullopt;
+  }
+
+  return scoreCoptModule(
+      *EvalMod,
+      TM);
+}
+static void
+writeCoptEvaluationReport(
+    StringRef Path,
+    StringRef FunctionName,
+    const CoptFunctionPlan &Plan,
+    const CoptModuleScore &Lower,
+    const CoptModuleScore &Candidate) {
+
+  if (Path.empty())
+    return;
+
+  json::Object LowerJSON;
+  LowerJSON["size_cost"] =
+      Lower.SizeCost;
+  LowerJSON["perf_cost_diagnostic_only"] =
+      Lower.PerfCost;
+  LowerJSON["total_profile_hotness"] =
+      Lower.TotalHotness;
+  LowerJSON["instruction_count"] =
+      static_cast<int64_t>(
+          Lower.InstructionCount);
+  LowerJSON["profiled_blocks"] =
+      static_cast<int64_t>(
+          Lower.ProfiledBlocks);
+  LowerJSON["fallback_blocks"] =
+      static_cast<int64_t>(
+          Lower.FallbackBlocks);
+
+  json::Object CandidateJSON;
+  CandidateJSON["size_cost"] =
+      Candidate.SizeCost;
+  CandidateJSON["perf_cost_diagnostic_only"] =
+      Candidate.PerfCost;
+  CandidateJSON["total_profile_hotness"] =
+      Candidate.TotalHotness;
+  CandidateJSON["instruction_count"] =
+      static_cast<int64_t>(
+          Candidate.InstructionCount);
+  CandidateJSON["profiled_blocks"] =
+      static_cast<int64_t>(
+          Candidate.ProfiledBlocks);
+  CandidateJSON["fallback_blocks"] =
+      static_cast<int64_t>(
+          Candidate.FallbackBlocks);
+
+  json::Object DeltaJSON;
+
+  DeltaJSON["size_cost"] =
+      Candidate.SizeCost -
+      Lower.SizeCost;
+
+  DeltaJSON["perf_cost_diagnostic_only"] =
+      Candidate.PerfCost -
+      Lower.PerfCost;
+
+  DeltaJSON["tti_performance_benefit_diagnostic_only"] =
+      Lower.PerfCost -
+      Candidate.PerfCost;
+
+  DeltaJSON["instruction_count"] =
+      static_cast<int64_t>(
+          Candidate.InstructionCount) -
+      static_cast<int64_t>(
+          Lower.InstructionCount);
+
+  json::Object Root;
+
+  Root["version"] = 1;
+  Root["function"] =
+      FunctionName;
+  Root["plan_id"] =
+      Plan.ID;
+  Root["lower_endpoint"] =
+      Plan.IsLowerEndpoint;
+  Root["upper_endpoint"] =
+      Plan.IsUpperEndpoint;
+
+  Root["global_lower"] =
+      std::move(LowerJSON);
+
+  Root["candidate"] =
+      std::move(CandidateJSON);
+
+  Root["delta"] =
+      std::move(DeltaJSON);
+
+  std::error_code EC;
+
+  raw_fd_ostream OS(
+      Path,
+      EC,
+      sys::fs::OF_Text);
+
+  if (EC)
+    report_fatal_error(
+        Twine("COPT: cannot write evaluation report: ") +
+        EC.message());
+
+  OS << formatv(
+      "{0:2}\n",
+      json::Value(std::move(Root)));
+}
+
+
+
+
+// copt_impl: BEGIN
+// COPT_INTERNAL_LTO_V2: legacy runNewPMPasses wrapper replaced by internal v2.
+
+// copt_impl: END
 
 static bool isEmptyModule(const Module &Mod) {
   // Module is empty if it has no functions, no globals, no inline asm and no

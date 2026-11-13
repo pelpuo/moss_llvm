@@ -23,6 +23,9 @@
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/CodeMetrics.h"
+#include "llvm/Analysis/ConstrainedOptimization.h"
+#include "llvm/Analysis/CoptNativePolicy.h" // copt_impl: ADDED
+#include "llvm/Support/FormatVariadic.h" // copt_impl: ADDED
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopPass.h"
@@ -226,11 +229,15 @@ TargetTransformInfo::UnrollingPreferences llvm::gatherUnrollingPreferences(
   TTI.getUnrollingPreferences(L, SE, UP, &ORE);
 
   // Apply size attributes
-  bool OptForSize = L->getHeader()->getParent()->hasOptSize() ||
-                    // Let unroll hints / pragmas take precedence over PGSO.
-                    (hasUnrollTransformation(L) != TM_ForcedByUser &&
-                     llvm::shouldOptimizeForSize(L->getHeader(), PSI, BFI,
-                                                 PGSOQueryType::IRPass));
+  // COPT_NATIVE_REGIONAL_V1: native regional O2 keeps LLVM's own unroll model but
+  // removes the enclosing function's size-policy restriction for this loop.
+  const bool CoptNativeO2 = CoptNativePolicy::get().useO2ForUnroll(*L);
+  bool OptForSize = !CoptNativeO2 &&
+                    (L->getHeader()->getParent()->hasOptSize() ||
+                     // Let unroll hints / pragmas take precedence over PGSO.
+                     (hasUnrollTransformation(L) != TM_ForcedByUser &&
+                      llvm::shouldOptimizeForSize(L->getHeader(), PSI, BFI,
+                                                  PGSOQueryType::IRPass)));
   if (OptForSize) {
     UP.Threshold = UP.OptSizeThreshold;
     UP.PartialThreshold = UP.PartialOptSizeThreshold;
@@ -411,7 +418,8 @@ static std::optional<EstimatedUnrollCost> analyzeLoopUnrollCost(
     assert(PHIUsedList.empty() && "Must start with an empty phi used list");
     CostWorklist.push_back(&RootI);
     TargetTransformInfo::TargetCostKind CostKind =
-      RootI.getFunction()->hasMinSize() ?
+      !CoptNativePolicy::get().useO2ForUnroll(*L) &&
+              RootI.getFunction()->hasMinSize() ?
       TargetTransformInfo::TCK_CodeSize :
       TargetTransformInfo::TCK_SizeAndLatency;
     for (;; --Iteration) {
@@ -503,7 +511,8 @@ static std::optional<EstimatedUnrollCost> analyzeLoopUnrollCost(
   LLVM_DEBUG(dbgs() << "Starting LoopUnroll profitability analysis...\n");
 
   TargetTransformInfo::TargetCostKind CostKind =
-    L->getHeader()->getParent()->hasMinSize() ?
+    !CoptNativePolicy::get().useO2ForUnroll(*L) &&
+        L->getHeader()->getParent()->hasMinSize() ?
     TargetTransformInfo::TCK_CodeSize : TargetTransformInfo::TCK_SizeAndLatency;
   // Simulate execution of each iteration of the loop counting instructions,
   // which would be simplified.
@@ -1297,8 +1306,265 @@ tryToUnrollLoop(Loop *L, DominatorTree &DT, LoopInfo *LI, ScalarEvolution &SE,
   bool IsCountSetExplicitly = computeUnrollCount(
       L, TTI, DT, LI, &AC, SE, EphValues, &ORE, TripCount, MaxTripCount,
       MaxOrZero, TripMultiple, UCE, UP, PP, UseUpperBound);
+  // COPT_NATIVE_REGIONAL_V1: BEGIN native unroll trace
+  {
+    CoptNativePolicy &CoptNative = CoptNativePolicy::get();
+    std::string CoptNativeRegionID = CoptNative.unrollRegionID(*L);
+    double CoptNativeProfileCount = 0.0;
+    if (BFI)
+      if (auto Count = BFI->getBlockProfileCount(
+              L->getHeader(), /*AllowSynthetic=*/true))
+        CoptNativeProfileCount = static_cast<double>(*Count);
+    CoptNative.noteUnrollProfile(*L, CoptNativeProfileCount);
+    CoptNative.traceUnroll(*L, CoptNativeRegionID, UP.Count);
+  }
+  // COPT_NATIVE_REGIONAL_V1: END native unroll trace
+
   if (!UP.Count)
     return LoopUnrollResult::Unmodified;
+
+  // copt_impl: BEGIN
+  //
+  // Milestone 3:
+  //   one loop region may now expose multiple replayable unroll states:
+  //
+  //     no-unroll
+  //     uf=2
+  //     uf=4
+  //     ...
+  //     uf=<LLVM selected upper count>
+  //
+  // We intentionally do not create arbitrary counts above the LLVM-selected
+  // upper/reference count.
+  if (UP.Count > 1 && PP.PeelCount == 0) {
+    CoptContext &COPT = CoptContext::get();
+
+    if (COPT.active()) {
+      const unsigned LLVMUpperCount = UP.Count;
+
+    std::string CoptRegionID =
+        COPT.isDiscover()
+            ? COPT.getOrCreateLoopRegionID(*L)
+            : COPT.computeLoopRegionID(*L);
+
+    std::string CoptID =
+        COPT.makeKeyID(
+            CoptKind::LoopUnroll,
+            CoptRegionID);
+
+      COPT.noteSeen(CoptID);
+
+      // ---------------------------------------------------------------------
+      // Build the replayable state set.
+      // ---------------------------------------------------------------------
+
+      SmallVector<unsigned, 8> CoptCounts;
+
+      // Intermediate powers of two below the upper/reference count.
+      //
+      // Do not expose partial states from the FullLoopUnroll-only pass. In that
+      // pass LLVM will intentionally reject a count smaller than the full count
+      // later in this routine.
+      if (!OnlyFullUnroll) {
+        for (unsigned Count = 2;
+            Count < LLVMUpperCount && Count != 0;
+            Count <<= 1) {
+
+          if (Count > UP.MaxCount)
+            break;
+
+          if (!UP.AllowRemainder &&
+              TripMultiple != 0 &&
+              TripMultiple % Count != 0)
+            continue;
+
+          CoptCounts.push_back(Count);
+
+          // Prevent unsigned overflow in Count <<= 1.
+          if (Count > LLVMUpperCount / 2)
+            break;
+        }
+      }
+
+      // The real LLVM-selected upper/reference state is always included.
+      CoptCounts.push_back(LLVMUpperCount);
+
+      llvm::sort(CoptCounts);
+      CoptCounts.erase(
+          std::unique(CoptCounts.begin(),
+                      CoptCounts.end()),
+          CoptCounts.end());
+
+      // ---------------------------------------------------------------------
+      // Discovery report.
+      // ---------------------------------------------------------------------
+
+      if (COPT.isDiscover()) {
+        CoptCandidate C;
+
+        C.ID = CoptID;
+        C.Kind = CoptKind::LoopUnroll;
+        C.Function =
+            L->getHeader()->getParent()->getName().str();
+        C.Stage = "full-lto-loop-unroll";
+
+        C.RegionKind =
+            CoptRegionKind::Loop;
+
+        C.RegionID = CoptRegionID;
+
+        COPT.populateLoopProvenance(C, *L);
+
+        DebugLoc DL = L->getStartLoc();
+
+        if (DL)
+          C.Location =
+              formatv("{0}:{1}",
+                      DL.getLine(),
+                      DL.getCol())
+                  .str();
+
+        // Conservative endpoint.
+        CoptAlternative NoUnroll;
+        NoUnroll.Name = "no-unroll";
+        NoUnroll.LLVMDefault = false;
+        NoUnroll.LowerEndpoint = true;
+
+        NoUnroll.SizeCost = 0.0;
+
+        NoUnroll.Metrics["unroll_count"] = 1.0;
+        NoUnroll.Metrics["rolled_size"] =
+            static_cast<double>(LoopSize);
+        NoUnroll.Metrics["unrolled_size"] =
+            static_cast<double>(LoopSize);
+
+        C.Alternatives.push_back(
+            std::move(NoUnroll));
+
+        // Intermediate + upper states.
+        for (unsigned Count : CoptCounts) {
+          CoptAlternative State;
+
+          State.Name =
+              formatv("uf={0}", Count).str();
+
+          State.LLVMDefault =
+              Count == LLVMUpperCount;
+
+          State.UpperEndpoint =
+              Count == LLVMUpperCount;
+
+          uint64_t EstimatedSize =
+              UCE.getUnrolledLoopSize(UP, Count);
+
+          int64_t SizeDelta =
+              static_cast<int64_t>(EstimatedSize) -
+              static_cast<int64_t>(LoopSize);
+
+          State.SizeCost =
+              static_cast<double>(SizeDelta);
+
+          State.Metrics["unroll_count"] =
+              static_cast<double>(Count);
+
+          State.Metrics["rolled_size"] =
+              static_cast<double>(LoopSize);
+
+          State.Metrics["unrolled_size"] =
+              static_cast<double>(EstimatedSize);
+
+          State.Metrics["is_full_unroll"] =
+              (TripCount != 0 && Count == TripCount)
+                  ? 1.0
+                  : 0.0;
+
+          C.Alternatives.push_back(
+              std::move(State));
+        }
+
+        COPT.report(std::move(C));
+      }
+
+      // ---------------------------------------------------------------------
+      // Apply replay.
+      // ---------------------------------------------------------------------
+
+      if (COPT.isApply()) {
+        if (auto Choice = COPT.selection(CoptID)) {
+          if (*Choice == "no-unroll") {
+            COPT.noteApplied(
+                CoptID,
+                "no-unroll");
+
+            return LoopUnrollResult::Unmodified;
+          }
+
+          // Legacy alias from Milestones 1/2:
+          //
+          //   "unroll" == keep LLVM's upper/default count.
+          if (*Choice == "unroll") {
+            COPT.noteApplied(
+                CoptID,
+                formatv("uf={0}",
+                        LLVMUpperCount)
+                    .str());
+          } else {
+            StringRef ChoiceRef(*Choice);
+
+            if (ChoiceRef.consume_front("uf=")) {
+              unsigned RequestedCount = 0;
+
+              if (ChoiceRef.getAsInteger(
+                      10, RequestedCount) ||
+                  RequestedCount < 2) {
+                report_fatal_error(
+                    Twine("COPT: invalid unroll state '") +
+                    *Choice + "'");
+              }
+
+              if (!llvm::is_contained(
+                      CoptCounts,
+                      RequestedCount)) {
+
+                std::string Reason =
+                    (Twine("requested unroll state '") +
+                    *Choice +
+                    "' is not replayable for candidate " +
+                    CoptID)
+                        .str();
+
+                if (COPT.isEvaluation()) {
+                  COPT.invalidateEvaluation(Reason);
+
+                  // The score for this clone will be discarded by LTOBackend.cpp.
+                  // Do not crash the compiler and do not apply a substitute unroll state.
+                  return LoopUnrollResult::Unmodified;
+                }
+
+                // Reaching this during the final apply indicates an internal COPT
+                // consistency error because final plans should have survived exact replay.
+                report_fatal_error(
+                    Twine("COPT: ") + Reason);
+              }
+              
+              UP.Count = RequestedCount;
+
+              // If discovery's upper state was a bounded/full-unroll decision
+              // and we select a smaller intermediate count, this must no longer
+              // be interpreted as upper-bound full unrolling.
+              if (RequestedCount != LLVMUpperCount)
+                UseUpperBound = false;
+
+              COPT.noteApplied(
+                  CoptID,
+                  *Choice);
+            }
+          }
+        }
+      }
+    }
+  }
+  // copt_impl: END
 
   UP.Runtime &= UCE.ConvergenceAllowsRuntime;
 

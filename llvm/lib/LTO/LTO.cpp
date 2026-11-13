@@ -11,6 +11,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/LTO/LTO.h"
+#include <mutex>
+#include <vector>
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallSet.h"
@@ -561,7 +563,37 @@ InputFile::~InputFile() = default;
 Expected<std::unique_ptr<InputFile>> InputFile::create(MemoryBufferRef Object) {
   std::unique_ptr<InputFile> File(new InputFile);
 
-  Expected<IRSymtabFile> FOrErr = readIRSymtab(Object);
+  // COPT_INTERNAL_PREIRSYMTAB_V413:
+  // Rewrite deferred bitcode before irsymtab freezes the symbol list.
+  // Rewritten buffers are owned until linker-process exit so every
+  // MemoryBufferRef and BitcodeModule view remains valid.
+  auto CoptBufferOrErr = lto::coptPreprocessRegularLTOInput(Object);
+  if (!CoptBufferOrErr)
+    return CoptBufferOrErr.takeError();
+  if (*CoptBufferOrErr) {
+    static std::mutex CoptOwnedBuffersMutex;
+    static std::vector<std::unique_ptr<MemoryBuffer>> CoptOwnedBuffers;
+    std::lock_guard<std::mutex> Lock(CoptOwnedBuffersMutex);
+    CoptOwnedBuffers.push_back(std::move(*CoptBufferOrErr));
+    Object = CoptOwnedBuffers.back()->getMemBufferRef();
+  }
+
+
+  
+
+
+  
+
+
+  
+
+
+  
+
+
+  
+
+Expected<IRSymtabFile> FOrErr = readIRSymtab(Object);
   if (!FOrErr)
     return FOrErr.takeError();
 
@@ -866,7 +898,7 @@ LTO::addRegularLTO(InputFile &Input, ArrayRef<SymbolResolution> InputRes,
   if (Error Err = M.materializeMetadata())
     return std::move(Err);
 
-  if (LTOMode == LTOK_UnifiedRegular) {
+if (LTOMode == LTOK_UnifiedRegular) {
     // cfi.functions metadata is intended to be used with ThinLTO and may
     // trigger invalid IR transformations if they are present when doing regular
     // LTO, so delete it.
@@ -923,7 +955,8 @@ LTO::addRegularLTO(InputFile &Input, ArrayRef<SymbolResolution> InputRes,
       if ((Flags & object::BasicSymbolRef::SF_Global) &&
           !(Flags & object::BasicSymbolRef::SF_FormatSpecific))
         return;
-      ++MsymI;
+
+++MsymI;
     }
   };
   Skip();

@@ -57,6 +57,10 @@ add_llvm_component_library(LLVMAnalysis
   CostModel.cpp
   CodeMetrics.cpp
   ConstantFolding.cpp
+  ConstrainedOptimization.cpp
+  CoptNativePolicy.cpp
+  CoptFunctionPlans.cpp
+  CoptSolver.cpp
   CtxProfAnalysis.cpp
   CycleAnalysis.cpp
   DDG.cpp

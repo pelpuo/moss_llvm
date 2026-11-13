@@ -83,6 +83,8 @@
 #include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/CodeMetrics.h"
+#include "llvm/Analysis/ConstrainedOptimization.h" // copt_impl: ADDED
+#include "llvm/Support/FormatVariadic.h" // copt_impl: ADDED
 #include "llvm/Analysis/DemandedBits.h"
 #include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/LoopAccessAnalysis.h"
@@ -10025,6 +10027,132 @@ bool LoopVectorizePass::processLoop(Loop *L) {
   VectorizationFactor VF = LVP.computeBestVF();
   unsigned IC = 1;
 
+  // copt_impl: BEGIN
+  CoptContext &COPT = CoptContext::get();
+
+  auto CoptVFStateName =
+      [](ElementCount Width) -> std::string {
+    return formatv(
+              "vf={0}:{1}",
+              Width.isScalable()
+                  ? "scalable"
+                  : "fixed",
+              Width.getKnownMinValue())
+        .str();
+  };
+
+  auto ParseCoptVFState =
+      [](StringRef Choice)
+          -> std::optional<ElementCount> {
+
+    if (!Choice.consume_front("vf="))
+      return std::nullopt;
+
+    bool IsScalable = false;
+
+    if (Choice.consume_front("fixed:")) {
+      IsScalable = false;
+    } else if (Choice.consume_front("scalable:")) {
+      IsScalable = true;
+    } else {
+      return std::nullopt;
+    }
+
+    unsigned Width = 0;
+
+    if (Choice.getAsInteger(10, Width) ||
+        Width < 2)
+      return std::nullopt;
+
+    if (IsScalable)
+      return ElementCount::getScalable(Width);
+
+    return ElementCount::getFixed(Width);
+  };
+
+  std::string CoptVectorID;
+  std::string CoptRegionID;
+
+  if (COPT.active() && VF.Width.isVector()) {
+  CoptRegionID =
+      COPT.isDiscover()
+          ? COPT.getOrCreateLoopRegionID(*L)
+          : COPT.computeLoopRegionID(*L);
+
+  CoptVectorID =
+      COPT.makeKeyID(
+          CoptKind::LoopVectorize,
+          CoptRegionID);
+
+    COPT.noteSeen(CoptVectorID);
+
+    // ---------------------------------------------------------------
+    // Apply replay.
+    // ---------------------------------------------------------------
+    if (COPT.isApply()) {
+      if (auto Choice =
+              COPT.selection(CoptVectorID)) {
+
+        if (*Choice == "no-vectorize") {
+          COPT.noteApplied(
+              CoptVectorID,
+              "no-vectorize");
+
+          return false;
+        }
+
+        // Legacy alias:
+        //
+        //   "vectorize" == keep LLVM's upper/default VF.
+        if (*Choice == "vectorize") {
+          COPT.noteApplied(
+              CoptVectorID,
+              CoptVFStateName(VF.Width));
+        } else {
+          auto RequestedWidth =
+              ParseCoptVFState(*Choice);
+
+          if (!RequestedWidth) {
+            report_fatal_error(
+                Twine("COPT: invalid vector state '") +
+                *Choice + "'");
+          }
+
+          bool Found = false;
+
+          // The upper/default VF is always allowed.
+          if (*RequestedWidth == VF.Width) {
+            Found = true;
+          } else {
+            for (const VectorizationFactor &CandidateVF :
+                LVP.getCoptProfitableVFs()) {
+              if (CandidateVF.Width != *RequestedWidth)
+                continue;
+
+              VF = CandidateVF;
+              Found = true;
+              break;
+            }
+          }
+
+          if (!Found ||
+              !LVP.hasPlanWithVF(VF.Width)) {
+            report_fatal_error(
+                Twine("COPT: requested vector state '") +
+                *Choice +
+                "' was not discovered for candidate " +
+                CoptVectorID);
+          }
+
+          COPT.noteApplied(
+              CoptVectorID,
+              *Choice);
+        }
+      }
+    }
+  }
+  // copt_impl: END
+
   if (ORE->allowExtraAnalysis(LV_NAME))
     LVP.emitInvalidCostRemarks(ORE);
 
@@ -10166,6 +10294,145 @@ bool LoopVectorizePass::processLoop(Loop *L) {
                       << ") in " << L->getLocStr() << '\n');
     LLVM_DEBUG(dbgs() << "LV: Interleave Count is " << IC << '\n');
   }
+
+   // copt_impl: BEGIN
+  //
+  // Report only an actual vectorization decision. Scalar interleaving is not
+  // treated as a vectorization candidate in this first version.
+  if (COPT.isDiscover() && VectorizeLoop && VF.Width.isVector() &&
+      !CoptVectorID.empty()) {
+    CoptCandidate C;
+    C.ID = CoptVectorID;
+    C.Kind = CoptKind::LoopVectorize;
+    C.Function = F->getName().str();
+    C.Stage = "full-lto-loop-vectorize";
+
+    C.RegionKind =
+    CoptRegionKind::Loop;
+
+    C.RegionID = CoptRegionID;
+
+    COPT.populateLoopProvenance(C, *L);
+
+    DebugLoc DL = L->getStartLoc();
+    if (DL)
+      C.Location =
+          formatv("{0}:{1}", DL.getLine(), DL.getCol()).str();
+
+    CoptAlternative Scalar;
+
+    Scalar.Name = "no-vectorize";
+    Scalar.LLVMDefault = false;
+    Scalar.LowerEndpoint = true;
+
+    Scalar.Metrics["vf"] = 1.0;
+    Scalar.Metrics["vf_scalable"] = 0.0;
+
+    if (VF.ScalarCost.isValid()) {
+      Scalar.Metrics["vectorizer_cost"] =
+          static_cast<double>(
+              VF.ScalarCost.getValue());
+
+      Scalar.Metrics["scalar_cost"] =
+          static_cast<double>(
+              VF.ScalarCost.getValue());
+    }
+
+    C.Alternatives.push_back(
+        std::move(Scalar));
+
+    // ---------------------------------------------------------------------
+    // Intermediate profitable VFs.
+    //
+    // computeBestVF() has already calculated these. We are only exposing the
+    // existing results.
+    // ---------------------------------------------------------------------
+
+    SmallVector<ElementCount, 8>
+        CoptSeenWidths;
+
+    auto AddCoptVFState =
+        [&](const VectorizationFactor &Factor,
+            bool IsUpper) {
+
+      if (!Factor.Width.isVector())
+        return;
+
+      if (llvm::is_contained(
+              CoptSeenWidths,
+              Factor.Width))
+        return;
+
+      CoptSeenWidths.push_back(
+          Factor.Width);
+
+      CoptAlternative State;
+
+      State.Name =
+          CoptVFStateName(Factor.Width);
+
+      State.LLVMDefault = IsUpper;
+      State.UpperEndpoint = IsUpper;
+
+      State.Metrics["vf"] =
+          static_cast<double>(
+              Factor.Width.getKnownMinValue());
+
+      State.Metrics["vf_scalable"] =
+          Factor.Width.isScalable()
+              ? 1.0
+              : 0.0;
+
+      State.Metrics["interleave_count_upper_path"] =
+          static_cast<double>(IC);
+
+      if (Factor.Cost.isValid()) {
+        State.Metrics["vectorizer_cost"] =
+            static_cast<double>(
+                Factor.Cost.getValue());
+      }
+
+      if (Factor.ScalarCost.isValid()) {
+        State.Metrics["scalar_cost"] =
+            static_cast<double>(
+                Factor.ScalarCost.getValue());
+      }
+
+      if (Factor.Cost.isValid() &&
+          Factor.ScalarCost.isValid()) {
+
+        double Benefit =
+            static_cast<double>(
+                Factor.ScalarCost.getValue()) -
+            static_cast<double>(
+                Factor.Cost.getValue());
+
+        // This is a native vectorizer benefit, not yet a globally comparable
+        // program-performance value.
+        State.PerfBenefit = Benefit;
+      }
+
+      C.Alternatives.push_back(
+          std::move(State));
+    };
+
+    for (const VectorizationFactor &Factor :
+        LVP.getCoptProfitableVFs()) {
+
+      AddCoptVFState(
+          Factor,
+          Factor.Width == VF.Width);
+    }
+
+    // A forced/default VF is not guaranteed to appear in ProfitableVFs.
+    // Always include the actual upper/reference state.
+    AddCoptVFState(
+        VF,
+        /*IsUpper=*/true);
+
+    COPT.report(std::move(C));
+  }
+  // copt_impl: END
 
   // Report the vectorization decision.
   if (VF.Width.isScalar()) {

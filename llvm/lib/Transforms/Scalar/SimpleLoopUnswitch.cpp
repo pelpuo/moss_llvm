@@ -19,6 +19,8 @@
 #include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/CodeMetrics.h"
+#include "llvm/Analysis/ConstrainedOptimization.h" // copt_impl: ADDED
+#include "llvm/Support/FormatVariadic.h" // copt_impl: ADDED
 #include "llvm/Analysis/DomTreeUpdater.h"
 #include "llvm/Analysis/GuardUtils.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
@@ -164,6 +166,7 @@ struct NonTrivialUnswitchCandidate {
   TinyPtrVector<Value *> Invariants;
   std::optional<InstructionCost> Cost;
   std::optional<InjectedInvariant> PendingInjection;
+  std::string CoptID; // copt_impl: ADDED
   NonTrivialUnswitchCandidate(
       Instruction *TI, ArrayRef<Value *> Invariants,
       std::optional<InstructionCost> Cost = std::nullopt,
@@ -3338,7 +3341,8 @@ static bool isSafeForNoNTrivialUnswitching(Loop &L, LoopInfo &LI) {
 }
 
 static NonTrivialUnswitchCandidate findBestNonTrivialUnswitchCandidate(
-    ArrayRef<NonTrivialUnswitchCandidate> UnswitchCandidates, const Loop &L,
+  // copt_impl: changed ArrayRef to MutableArrayRef to allow for injection of new candidates
+    MutableArrayRef<NonTrivialUnswitchCandidate> UnswitchCandidates, const Loop &L,
     const DominatorTree &DT, const LoopInfo &LI, AssumptionCache &AC,
     const TargetTransformInfo &TTI, const IVConditionInfo &PartialIVInfo) {
   // Given that unswitching these terminators will require duplicating parts of
@@ -3462,6 +3466,7 @@ static NonTrivialUnswitchCandidate findBestNonTrivialUnswitchCandidate(
         (Invariants.size() == 1 &&
          Invariants[0] == skipTrivialSelect(BI->getCondition()));
     InstructionCost CandidateCost = ComputeUnswitchedCost(TI, FullUnswitch);
+    
     // Calculate cost multiplier which is a tool to limit potentially
     // exponential behavior of loop-unswitch.
     if (EnableUnswitchCostMultiplier) {
@@ -3549,6 +3554,80 @@ static bool unswitchBestCondition(Loop &L, DominatorTree &DT, LoopInfo &LI,
                       << "\n");
     return false;
   }
+
+  // copt_impl: BEGIN
+  CoptContext &COPT = CoptContext::get();
+
+  if (COPT.active()) {
+    std::string Extra =
+        formatv("candidate-opcode={0}",
+                Best.TI ? Best.TI->getOpcodeName() : "unknown")
+            .str();
+
+    std::string CoptID =
+        COPT.makeLoopID(CoptKind::NonTrivialUnswitch, L, Extra);
+
+    COPT.noteSeen(CoptID);
+
+    CoptCandidate C;
+    C.ID = CoptID;
+    C.Kind = CoptKind::NonTrivialUnswitch;
+    C.Function = L.getHeader()->getParent()->getName().str();
+    C.Stage = "full-lto-nontrivial-unswitch";
+
+    if (COPT.isDiscover()) {
+      C.RegionKind =
+          CoptRegionKind::Loop;
+
+      C.RegionID =
+          COPT.getOrCreateLoopRegionID(L);
+
+      COPT.populateLoopProvenance(C, L);
+    }
+
+    if (Best.TI) {
+      if (DebugLoc DL = Best.TI->getDebugLoc())
+        C.Location =
+            formatv("{0}:{1}", DL.getLine(), DL.getCol()).str();
+    }
+
+    CoptAlternative NoUnswitch;
+    NoUnswitch.Name = "no-unswitch";
+    NoUnswitch.LLVMDefault = false;
+    NoUnswitch.LowerEndpoint = true;
+
+    CoptAlternative Unswitch;
+    Unswitch.Name = "unswitch";
+    Unswitch.LLVMDefault = true;
+    Unswitch.UpperEndpoint = true;
+    
+    // This is LLVM's native duplication/unswitch cost.
+    // Do not treat it as a globally comparable runtime benefit.
+    Unswitch.SizeCost =
+        static_cast<double>(Best.Cost->getValue());
+    Unswitch.Metrics["unswitch_cost"] =
+        static_cast<double>(Best.Cost->getValue());
+    Unswitch.Metrics["unswitch_threshold"] =
+        static_cast<double>(UnswitchThreshold);
+
+    C.Alternatives.push_back(std::move(NoUnswitch));
+    C.Alternatives.push_back(std::move(Unswitch));
+
+    COPT.report(std::move(C));
+
+    if (COPT.isApply()) {
+      if (auto Choice = COPT.selection(CoptID)) {
+        if (*Choice == "no-unswitch") {
+          COPT.noteApplied(CoptID, "no-unswitch");
+          return false;
+        }
+
+        if (*Choice == "unswitch")
+          COPT.noteApplied(CoptID, "unswitch");
+      }
+    }
+  }
+  // copt_impl: END
 
   bool InjectedCondition = false;
   if (Best.hasPendingInjection()) {

@@ -24,6 +24,7 @@
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/Analysis/ScopedNoAliasAA.h"
 #include "llvm/Analysis/TypeBasedAliasAnalysis.h"
+// #include "llvm/Analysis/ConstrainedOptimization.h" // copt_impl: ADDED
 #include "llvm/IR/PassManager.h"
 #include "llvm/Pass.h"
 #include "llvm/Passes/OptimizationLevel.h"
@@ -147,6 +148,8 @@
 #include "llvm/Transforms/Vectorize/LoopVectorize.h"
 #include "llvm/Transforms/Vectorize/SLPVectorizer.h"
 #include "llvm/Transforms/Vectorize/VectorCombine.h"
+
+#include "llvm/Analysis/ConstrainedOptimization.h"
 
 using namespace llvm;
 
@@ -1866,6 +1869,9 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
                                      ModuleSummaryIndex *ExportSummary) {
   ModulePassManager MPM;
 
+  // copt_impl
+  // MPM.addPass(CoptBeginPass());
+
   invokeFullLinkTimeOptimizationEarlyEPCallbacks(MPM, Level);
 
   // Create a function that performs CFI checks for cross-DSO calls with targets
@@ -1888,7 +1894,9 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
 
     // Emit annotation remarks.
     addAnnotationRemarksPass(MPM);
-
+    
+    // copt_impl
+    // MPM.addPass(CoptEndPass());
     return MPM;
   }
 
@@ -1975,6 +1983,8 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
     // Emit annotation remarks.
     addAnnotationRemarksPass(MPM);
 
+    // copt_impl 
+    // MPM.addPass(CoptEndPass());
     return MPM;
   }
 
@@ -2207,7 +2217,9 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
 
   // Emit annotation remarks.
   addAnnotationRemarksPass(MPM);
-
+  
+  // copt_impl
+  // MPM.addPass(CoptEndPass());
   return MPM;
 }
 

@@ -513,6 +513,17 @@ public:
   /// all profitable VFs in ProfitableVFs.
   VectorizationFactor computeBestVF();
 
+  /// COPT discovery helper.
+  ///
+  /// computeBestVF() already populates ProfitableVFs while evaluating the
+  /// candidate VPlans. Expose that existing information read-only so COPT can
+  /// represent multiple valid vectorization states without rebuilding or
+  /// executing those VPlans.
+  ArrayRef<VectorizationFactor>
+  getCoptProfitableVFs() const {
+    return ProfitableVFs;
+  }
+
   /// \return The desired interleave count.
   /// If interleave count has been specified by metadata it will be returned.
   /// Otherwise, the interleave count is computed and returned. VF and LoopCost
